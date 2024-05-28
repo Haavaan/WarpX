@@ -65,19 +65,38 @@ computePhiIGF ( amrex::MultiFab const & rho,
         {2*nx-1+domain.smallEnd(0), 2*ny-1+domain.smallEnd(1), 2*nz-1+domain.smallEnd(2)},
         amrex::IntVect::TheNodeVector() );
 
-    // Initialize the boxarray in "realspace_ba" from the single box "realspace_box"
-    amrex::BoxArray realspace_ba = amrex::BoxArray( realspace_box );
-
-    int const max_nz_box = (2*nz-1) / nprocs + (2*nz-1) % nprocs ;
-
-     // create IntVect of max_grid_size
-    amrex::IntVect max_size(AMREX_D_DECL(2*nx-1, 2*ny-1, max_nz_box));
-
-    // Break up boxarray "ba" into chunks no larger than "max_size" along a direction
-    realspace_ba.maxSize(max_size);
-
-    // How Boxes are distrubuted among MPI processes
-    amrex::DistributionMapping realspace_dm(realspace_ba);
+    amrex::BoxArray realspace_ba;
+    amrex::DistributionMapping realspace_dm;
+    {
+        int realspace_nx = realspace_box.length(0);
+        int realspace_ny = realspace_box.length(1);
+        int realspace_nz = realspace_box.length(2);
+        int minsize_z = realspace_nz / nprocs;
+        int nleft_z = realspace_nz - minsize_z*nprocs;
+        AMREX_ALWAYS_ASSERT(realspace_nz >= nprocs);
+        // We are going to split realspace_box in such a way that the first
+        // nleft boxes has minsize_z+1 nodes and the others minsize
+        // nodes. We do it this way instead of BoxArray::maxSize to make
+        // sure there are exactly nprocs boxes and there are no overlaps.
+        BoxList bl(IndexType::TheNodeType);
+        for (int iproc = 0; iproc < nprocs; ++iproc) {
+            int zlo, zhi;
+            if (iproc < nleft_z) {
+                zlo = iproc*(minsize_z+1);
+                zhi = zlo + minsize_z;
+            } else {
+                zlo = iproc*minsize_z + nleft_z;
+                zhi = zlo + minsize_z - 1;
+            }
+            Box tbx(IntVect(0,0,zlo),IntVect(realspace_nx,realspace_ny,zhi),IntVect(1));
+            tbx.shift(realspace_box.smallEnd());
+            bl.push_back(tbx);
+        }
+        realspace_ba.define(std::move(bl));
+        Vector<int> pmap(nprocs);
+        std::iota(pmap.begin(), pmap.end(), 0);
+        realspace_dm.define(std::move(pmap));
+    }
 
     // Allocate required arrays
     amrex::MultiFab tmp_rho = amrex::MultiFab(realspace_ba, realspace_dm, 1, 0);
@@ -91,23 +110,10 @@ computePhiIGF ( amrex::MultiFab const & rho,
     amrex::AllPrint() << realspace_ba << std::endl;
     amrex::AllPrint() << realspace_dm << std::endl;
 
-    // check to make sure each MPI rank has exactly 1 box
-    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(tmp_rho.local_size() == 1, "Must have one Box per MPI process");
-
-    // since there is 1 MPI rank per box, here each MPI rank obtains its local box and the associated boxid
-    amrex::Box local_box;
-    int local_boxid;
-        for (int i = 0; i < realspace_ba.size(); ++i) {
-            amrex::Box b = realspace_ba[i];
-            // each MPI rank has its own local_box Box and local_boxid ID
-            if (amrex::ParallelDescriptor::MyProc() == realspace_dm[i]) {
-                local_box = b;
-                local_boxid = i;
-            }
-        }
-
-    // Copy from rho to tmp_rho
-    tmp_rho.ParallelCopy( rho, 0, 0, 1, amrex::IntVect::TheZeroVector(), amrex::IntVect::TheZeroVector() );
+    // Copy from rho including its ghost cells to tmp_rho
+    // w.z.: please check. I think we need to use rho.nGrowVect() otherwise
+    // the data outside the ba.minimalBox() will not be copied over.
+    tmp_rho.ParallelCopy( rho, 0, 0, 1, rho.nGrowVect(), amrex::IntVect::TheZeroVector() );
 
     // Compute the integrated Green function
     {
@@ -167,22 +173,18 @@ computePhiIGF ( amrex::MultiFab const & rho,
     }
 
 
-    // start by coarsening each box by 2 in the x-direction
-    amrex::Box c_local_box = amrex::coarsen(local_box, amrex::IntVect(AMREX_D_DECL(2,1,1)));
+    // since there is 1 MPI rank per box, here each MPI rank obtains its local box and the associated boxid
+    int local_boxid = amrex::ParallelDescriptor::MyProc(); // because of how we made the DistributionMapping
+    amrex::Box local_nodal_box = realspace_ba[local_boxid];
+    amrex::Box local_box(local_nodal_box.smallEnd(), local_nodal_box.bigEnd());
+    local_box.shift(-realspace_box.smallEnd()); // This simplifies the setup because the global lo is zero now
 
-    // if the coarsened box's high-x index tmp_rho_fftis even, we shrink the size in 1 in x
-    // this avoids overlap between coarsened boxes
-    /*if (c_local_box.bigEnd(0) * 2 == local_box.bigEnd(0)) {
-        c_local_box.setBig(0,c_local_box.bigEnd(0)-1);
-    }
-    // for any boxes that touch the hi-x domain we
-    // increase the size of boxes by 1 in x
-    // this makes the overall fft dataset have size (Nx/2+1 x Ny x Nz)
-    if (local_box.bigEnd(0) == nx) {
-        c_local_box.growHi(0,1);
-    }*/
+    // Since we the domain decompostion is in the z-direction, setting up
+    // c_local_box is simple.
+    amrex::Box c_local_box = local_box;
+    c_local_box.setBig(0, local_box.length(0)/2+1);
 
-    amrex::AllPrint() << "myProc = " << amrex::ParallelDescriptor::MyProc() << " , local box = " << local_box <<  " coars local box = " << c_local_box << std::endl;
+    amrex::AllPrint() << "myProc = " << amrex::ParallelDescriptor::MyProc() << " , local box = " << local_box <<  " complex local box = " << c_local_box << std::endl;
 
     using SpectralField = amrex::BaseFab< amrex::GpuComplex< amrex::Real > > ;
     SpectralField tmp_rho_fft(c_local_box, 1, amrex::The_Device_Arena());
